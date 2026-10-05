@@ -140,46 +140,47 @@ ShadeVault relies on Supabase PostgreSQL for data persistence across three core 
 
 ```mermaid
 erDiagram
-    products {
-        uuid id PK
-        text name
-        text slug
-        text description
-        numeric price
-        text image_url
-        text category
-        integer stock
-        text frame_color
-        text lens_color
-        integer reviews_count
+    PRODUCTS {
+        string id PK
+        string name
+        string slug
+        string description
+        number price
+        string image_url
+        string category
+        int stock
+        string frame_color
+        string lens_color
+        int reviews_count
         boolean is_new
         boolean is_bestseller
-        jsonb features
-        timestamp created_at
+        string features
+        string created_at
     }
 
-    orders {
-        text id PK
-        uuid user_id FK
-        text status
-        numeric total
-        numeric subtotal
-        numeric tax
-        integer items_count
-        text shipping_address
-        text email
-        timestamp created_at
+    ORDERS {
+        string id PK
+        string user_id FK
+        string status
+        number total
+        number subtotal
+        number tax
+        int items_count
+        string shipping_address
+        string email
+        string created_at
     }
 
-    order_items {
-        bigserial id PK
-        text order_id FK
-        text product_id
-        integer quantity
-        numeric price_at_time
+    ORDER_ITEMS {
+        int id PK
+        string order_id FK
+        string product_id FK
+        int quantity
+        number price_at_time
     }
 
-    orders ||--|{ order_items : "contains"
+    ORDERS ||--|{ ORDER_ITEMS : contains
+    PRODUCTS ||--o{ ORDER_ITEMS : ordered_in
 ```
 
 ### Table Details
