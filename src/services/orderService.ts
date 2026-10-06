@@ -5,7 +5,6 @@ import { createClient as createServerClient } from '@/utils/supabase/server';
 import { getProductByIdOrSlug } from '@/services/productService';
 import { sendOrderConfirmationEmail } from '@/services/emailService';
 import { Order } from '@/types/product';
-import { MOCK_ORDERS } from '@/data/mockProducts';
 
 export interface CheckoutInput {
   firstName: string;
@@ -88,20 +87,23 @@ export async function createOrderServerAction(input: CheckoutInput): Promise<Che
     const serverTax = Math.round(serverSubtotal * 0.08);
     const serverTotal = serverSubtotal + serverTax;
 
-    const orderId = `ORD-2026-${Math.floor(1000 + Math.random() * 9000)}`;
+    const databaseOrderId = crypto.randomUUID();
+    const orderNumber = `ORD-2026-${Math.floor(1000 + Math.random() * 9000)}`;
     const fullAddress = `${input.firstName} ${input.lastName}, ${input.streetAddress}, ${input.city}, ${input.postalCode}`;
     const dateStr = new Date().toISOString().split('T')[0];
 
     // 3. Insert into Supabase public.orders and public.order_items
     const orderData = {
-      id: orderId,
+      id: databaseOrderId,
+      order_number: orderNumber,
       user_id: userId,
-      status: 'Processing',
+      customer_email: userEmail,
       total: serverTotal,
       subtotal: serverSubtotal,
       tax: serverTax,
       items_count: totalItemsCount,
       shipping_address: fullAddress,
+      status: 'processing',
       email: userEmail,
       created_at: new Date().toISOString(),
     };
@@ -112,28 +114,30 @@ export async function createOrderServerAction(input: CheckoutInput): Promise<Che
 
     if (insertOrderErr) {
       console.warn('Notice: Inserting into public.orders table:', insertOrderErr.message);
-    } else {
-      // Insert order items
-      const itemsToInsert = validatedOrderItems.map((item) => ({
-        order_id: orderId,
-        product_id: item.productId,
-        quantity: item.quantity,
-        price_at_time: item.price,
-      }));
+      return { success: false, error: 'Database order save failed.' };
+    }
 
-      const { error: insertItemsErr } = await supabase
-        .from('order_items')
-        .insert(itemsToInsert);
+    // Insert order items
+    const itemsToInsert = validatedOrderItems.map((item) => ({
+      order_id: databaseOrderId,
+      product_id: item.productId,
+      quantity: item.quantity,
+      unit_price: item.price,
+    }));
 
-      if (insertItemsErr) {
-        console.warn('Notice: Inserting into public.order_items table:', insertItemsErr.message);
-      }
+    const { error: insertItemsErr } = await supabase
+      .from('order_items')
+      .insert(itemsToInsert);
+
+    if (insertItemsErr) {
+      console.warn('Notice: Inserting into public.order_items table:', insertItemsErr.message);
+      return { success: false, error: 'Database order save failed.' };
     }
 
     // 4. Server-side Mailgun email dispatch (non-blocking fallback)
     try {
       await sendOrderConfirmationEmail({
-        orderId,
+        orderId: orderNumber,
         dateStr,
         customerEmail: userEmail,
         items: validatedOrderItems.map((item) => ({
@@ -147,12 +151,12 @@ export async function createOrderServerAction(input: CheckoutInput): Promise<Che
         shippingAddress: fullAddress,
       });
     } catch (emailErr) {
-      console.warn(`[MAILGUN NON-BLOCKING NOTICE] Email dispatch error for order ${orderId}:`, emailErr);
+      console.warn(`[MAILGUN NON-BLOCKING NOTICE] Email dispatch error for order ${orderNumber}:`, emailErr);
     }
 
     return {
       success: true,
-      orderId,
+      orderId: orderNumber,
       total: serverTotal,
       itemsCount: totalItemsCount,
     };
@@ -167,7 +171,7 @@ export async function createOrderServerAction(input: CheckoutInput): Promise<Che
 }
 
 /**
- * Fetch authenticated user orders from Supabase (with fallback).
+ * Fetch authenticated user orders from Supabase.
  */
 export async function getAuthenticatedUserOrders(): Promise<{ orders: Order[]; isAuthenticated: boolean; userEmail?: string }> {
   try {
@@ -179,16 +183,27 @@ export async function getAuthenticatedUserOrders(): Promise<{ orders: Order[]; i
       return { orders: [], isAuthenticated: false };
     }
 
-    // Attempt to query Supabase orders for this user
+    // Attempt to query Supabase orders for this authenticated user
     const { data: dbOrders, error } = await supabase
       .from('orders')
       .select('*, order_items(*)')
       .eq('user_id', user.id)
       .order('created_at', { ascending: false });
 
-    if (!error && dbOrders && dbOrders.length > 0) {
-      const orders: Order[] = dbOrders.map((row: Record<string, unknown>) => ({
-        id: String(row.id || ''),
+    if (error) {
+      console.warn('Notice: Fetching authenticated user orders from Supabase:', error.message);
+      return { orders: [], isAuthenticated: true, userEmail: user.email };
+    }
+
+    if (!dbOrders || dbOrders.length === 0) {
+      return { orders: [], isAuthenticated: true, userEmail: user.email };
+    }
+
+    const orders: Order[] = dbOrders.map((row: Record<string, unknown>) => {
+      const orderNum = String(row.order_number || row.id || '');
+      return {
+        id: orderNum,
+        orderNumber: orderNum,
         date: typeof row.created_at === 'string' ? row.created_at.split('T')[0] : '2026-10-03',
         status: (row.status as Order['status']) || 'Processing',
         total: Number(row.total) || 0,
@@ -204,15 +219,12 @@ export async function getAuthenticatedUserOrders(): Promise<{ orders: Order[]; i
               imageUrl: String(item.image_url || ''),
             }))
           : [],
-      }));
+      };
+    });
 
-      return { orders, isAuthenticated: true, userEmail: user.email };
-    }
-
-    // If database table is not populated yet or user has demo orders, return MOCK_ORDERS
-    return { orders: MOCK_ORDERS, isAuthenticated: true, userEmail: user.email };
+    return { orders, isAuthenticated: true, userEmail: user.email };
   } catch (err) {
     console.warn('Error fetching user orders:', err);
-    return { orders: MOCK_ORDERS, isAuthenticated: false };
+    return { orders: [], isAuthenticated: false };
   }
 }

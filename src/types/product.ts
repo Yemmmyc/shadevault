@@ -33,6 +33,7 @@ export interface CartItem {
 
 export interface Order {
   id: string;
+  orderNumber?: string;
   date: string;
   status: 'Processing' | 'Shipped' | 'Delivered' | 'Cancelled';
   total: number;
