@@ -18,10 +18,16 @@ function LoginContent() {
       setLoading(true);
       setError(null);
       const supabase = createClient();
+      const origin =
+        typeof window !== 'undefined' && window.location.origin
+          ? window.location.origin
+          : 'http://localhost:3000';
+      const redirectTo = `${origin}/auth/callback`;
+
       const { error: authError } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: `${window.location.origin}/auth/callback`,
+          redirectTo,
         },
       });
 

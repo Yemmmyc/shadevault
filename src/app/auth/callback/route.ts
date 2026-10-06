@@ -17,7 +17,8 @@ export async function GET(request: Request) {
       const isLocalEnv = process.env.NODE_ENV === 'development';
 
       if (isLocalEnv) {
-        return NextResponse.redirect(`${origin}${next}`);
+        const localOrigin = origin.includes('localhost') ? origin : 'http://localhost:3000';
+        return NextResponse.redirect(`${localOrigin}${next}`);
       } else if (forwardedHost) {
         return NextResponse.redirect(`https://${forwardedHost}${next}`);
       } else {

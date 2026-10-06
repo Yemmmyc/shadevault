@@ -2,9 +2,9 @@
 
 import { cookies } from 'next/headers';
 import { createClient as createServerClient } from '@/utils/supabase/server';
-import { getProductByIdOrSlug } from '@/services/productService';
+import { getProductByIdOrSlug, normalizeProduct } from '@/services/productService';
 import { sendOrderConfirmationEmail } from '@/services/emailService';
-import { Order } from '@/types/product';
+import { Order, Product } from '@/types/product';
 
 export interface CheckoutInput {
   firstName: string;
@@ -183,15 +183,35 @@ export async function getAuthenticatedUserOrders(): Promise<{ orders: Order[]; i
       return { orders: [], isAuthenticated: false };
     }
 
-    // Attempt to query Supabase orders for this authenticated user
-    const { data: dbOrders, error } = await supabase
+    // 1. Query Supabase orders for this authenticated user, joining order_items and products
+    let dbOrders: Record<string, unknown>[] | null = null;
+    let queryError: unknown = null;
+
+    const relSelect = await supabase
       .from('orders')
-      .select('*, order_items(*)')
+      .select('*, order_items(*, products(*))')
       .eq('user_id', user.id)
       .order('created_at', { ascending: false });
 
-    if (error) {
-      console.warn('Notice: Fetching authenticated user orders from Supabase:', error.message);
+    if (!relSelect.error && relSelect.data) {
+      dbOrders = relSelect.data as Record<string, unknown>[];
+    } else {
+      // Fallback query if relational join fails
+      const simpleSelect = await supabase
+        .from('orders')
+        .select('*, order_items(*)')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false });
+
+      if (simpleSelect.error) {
+        queryError = simpleSelect.error;
+      } else {
+        dbOrders = simpleSelect.data as Record<string, unknown>[];
+      }
+    }
+
+    if (queryError) {
+      console.warn('Notice: Fetching authenticated user orders from Supabase:', (queryError as { message: string }).message);
       return { orders: [], isAuthenticated: true, userEmail: user.email };
     }
 
@@ -199,26 +219,90 @@ export async function getAuthenticatedUserOrders(): Promise<{ orders: Order[]; i
       return { orders: [], isAuthenticated: true, userEmail: user.email };
     }
 
+    // 2. Collect product IDs that need server-side enrichment
+    const productIdsToFetch = new Set<string>();
+    for (const row of dbOrders) {
+      if (Array.isArray(row.order_items)) {
+        for (const item of row.order_items as Record<string, unknown>[]) {
+          const pid = String(item.product_id || '');
+          if (pid && (!item.products || typeof item.products !== 'object')) {
+            productIdsToFetch.add(pid);
+          }
+        }
+      }
+    }
+
+    // 3. Batch fetch missing product records from Supabase
+    const fetchedProductMap = new Map<string, Product>();
+    if (productIdsToFetch.size > 0) {
+      const pidArray = Array.from(productIdsToFetch);
+      const { data: dbProducts } = await supabase
+        .from('products')
+        .select('*')
+        .in('id', pidArray);
+
+      if (dbProducts && dbProducts.length > 0) {
+        for (const rawP of dbProducts) {
+          const normP = normalizeProduct(rawP as Record<string, unknown>);
+          fetchedProductMap.set(normP.id, normP);
+          if (normP.slug) fetchedProductMap.set(normP.slug, normP);
+        }
+      }
+
+      // Check any unresolved product IDs via getProductByIdOrSlug fallback
+      for (const pid of pidArray) {
+        if (!fetchedProductMap.has(pid)) {
+          const p = await getProductByIdOrSlug(pid);
+          if (p) {
+            fetchedProductMap.set(pid, p);
+          }
+        }
+      }
+    }
+
+    // 4. Map DB order rows and enriched order_items to Order models
     const orders: Order[] = dbOrders.map((row: Record<string, unknown>) => {
       const orderNum = String(row.order_number || row.id || '');
+      const rawStatus = String(row.status || 'Processing');
+      const formattedStatus = (rawStatus.charAt(0).toUpperCase() + rawStatus.slice(1)) as Order['status'];
+
+      const items = Array.isArray(row.order_items)
+        ? (row.order_items as Record<string, unknown>[]).map((item: Record<string, unknown>) => {
+            const pid = String(item.product_id || '');
+            let prod: Product | null = null;
+
+            if (item.products && typeof item.products === 'object') {
+              prod = normalizeProduct(item.products as Record<string, unknown>);
+            }
+            if (!prod && pid) {
+              prod = fetchedProductMap.get(pid) || null;
+            }
+
+            const price = Number(item.unit_price ?? item.price_at_time ?? prod?.price ?? 0);
+            const quantity = Number(item.quantity) || 1;
+            const productName = prod?.name || (pid ? `Eyewear (${pid})` : 'Eyewear Item');
+            const imageUrl = prod?.imageUrl || prod?.image_url || '';
+
+            return {
+              productId: pid,
+              productName,
+              price,
+              quantity,
+              imageUrl,
+            };
+          })
+        : [];
+
       return {
         id: orderNum,
         orderNumber: orderNum,
-        date: typeof row.created_at === 'string' ? row.created_at.split('T')[0] : '2026-10-03',
-        status: (row.status as Order['status']) || 'Processing',
+        date: typeof row.created_at === 'string' ? row.created_at.split('T')[0] : new Date().toISOString().split('T')[0],
+        status: formattedStatus,
         total: Number(row.total) || 0,
-        itemsCount: Number(row.items_count) || 1,
+        itemsCount: Number(row.items_count) || items.reduce((sum, i) => sum + i.quantity, 0) || 1,
         shippingAddress: String(row.shipping_address || 'Shipping Address Provided'),
         trackingNumber: String(row.tracking_number || `TRK-${Math.floor(100000000 + Math.random() * 900000000)}`),
-        items: Array.isArray(row.order_items)
-          ? (row.order_items as Record<string, unknown>[]).map((item: Record<string, unknown>) => ({
-              productId: String(item.product_id || ''),
-              productName: String(item.product_name || 'ShadeVault Eyewear'),
-              price: Number(item.price_at_time) || 0,
-              quantity: Number(item.quantity) || 1,
-              imageUrl: String(item.image_url || ''),
-            }))
-          : [],
+        items,
       };
     });
 
